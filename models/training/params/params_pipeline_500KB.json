@@ -1,0 +1,10 @@
+{    
+    "feature_selection__threshold": "['0.1*mean', '0.15*mean', '0.25*mean', '0.5*mean', '0.1*median', '0.15*median', '0.25*median', '0.5*median']",
+    "preprocessing__kbdiscretizer__n_bins": "[i for i in range(5, 30)]",
+    "model__n_estimators" : "[i for i in range(10, 100)]",
+    "model__criterion" : "['gini', 'entropy']",
+    "model__max_depth" : "[i for i in range(5, 30)]",
+    "model__min_samples_split" : "[i for i in range(5, 10)]",
+    "model__min_samples_leaf" : "[i for i in range(2, 10)]",
+    "model__max_features" : "uniform(0.1, 0.85)"
+}

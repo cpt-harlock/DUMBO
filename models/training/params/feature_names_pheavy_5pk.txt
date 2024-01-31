@@ -1,0 +1,14 @@
+src_port
+dst_port
+pk_size_mean_6
+pk_size_std_6
+iat_mean_5
+iat_std_5
+count_synack_5
+count_pshecerst_5
+pk_size_min_6
+iat_min_5
+pk_size_max_6
+iat_max_5
+pk_size_sum_6
+iat_sum_5

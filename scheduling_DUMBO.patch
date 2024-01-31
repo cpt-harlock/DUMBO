@@ -1,0 +1,2220 @@
+diff --git a/.gitignore b/.gitignore
+index ae6bcf5..6e73684 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -14,3 +14,5 @@ install-sh
+ *.dirstamp*
+ simulator
+ simdebug
++result*.txt
++conf*.txt
+diff --git a/Makefile.am b/Makefile.am
+index 57dbb10..9d9a6b6 100644
+--- a/Makefile.am
++++ b/Makefile.am
+@@ -28,6 +28,8 @@ simulator_SOURCES = 				 		 	 \
+ 					ext/dctcpQueue.cpp			 \
+ 					ext/dctcpFlow.cpp			 \
+ 					ext/ideal.cpp				 \
++					ext/modelflow.cpp                        \
++					ext/flowsizeoracle.cpp			 \
+ 					run/params.cpp 		 	 	 \
+ 					run/stats.cpp 			   	 \
+ 					run/flow_generator.cpp       \
+@@ -42,3 +44,5 @@ simdebug_CXXFLAGS  = -g -O0 -gdwarf-2 -Wall -std=c++0x
+ #CFLAGS = -g -O3 -gdwarf-2 -Wall -std=c++0x 
+ #CXXFLAGS = -g -O3 -gdwarf-2 -Wall -std=c++0x 
+ 
++#ext/modelflow.cpp				 
++#ext/flowsizeoracle.cpp				 
+diff --git a/README.md b/README.md
+deleted file mode 100644
+index 46cea00..0000000
+--- a/README.md
++++ /dev/null
+@@ -1,50 +0,0 @@
+-YAPS = Yet Another Packet Simulator
+-==================================
+-
+-Core stuff is in `coresim/` 
+----------------------------
+-Normally these files shouldn't change. This directory includes implementations of the following:
+-* Main event loop and related helper functions, global variables, main() function to determine which experiment to run: `main.cpp`
+-    * Note: deciding which experiment to run will eventually be moved to the `run/` directory, probably to `experiment.cpp`.
+-* Core event implementations (`Event`, `FlowArrivalEvent`, `FlowFinishedEvent`, etc): `event.cpp`.
+-* Representation of the topology: `node.cpp`, `topology.cpp`
+-* Queueing behavior. This is a basis for extension; the default implementation is FIFO-dropTail: `queue.cpp`.
+-* Flows and packets. This is also a basis for extension; default is TCP: `packet.cpp` and `flow.cpp`.
+-* Random variables used in flow generation. Used as a library by the flow generation code: `random_variable.cpp`.
+-
+-Extensions are in `ext/`
+------------------------
+-This is where you implement your favorite protocol.
+-* Generally extensions are created by subclassing one or more aspects of classes defined in `coresim/`.
+-* Once an extension is defined, it should be added to `factory.cpp` so it can be run. 
+-    * Currently, `factory.cpp` supports changing the flow, queue, and host-scheduling implementations.
+-* Methods in `coresim/` call the `get_...` methods in `factory.cpp` to initialize the simulation with the correct implementation.
+-* Which implementation to use from `factory.cpp` is determined by the config file, parsed by `run/params.cpp`.
+-    * You should give your extension an identifier in `factory.h` so it can be uniquely identified in the config file.
+-
+-Stuff related to actually running the simulator is in `run/`
+-------------------------------------------------------------
+-* Experiment setup, running, and post-analysis: `experiment.cpp`
+-* Flow generation models: `flow_generator.cpp`
+-* Parsing of config file: `params.cpp`
+-    * Configuration parameters for your extension should be added to `params.h` and `params.cpp`.
+-    * These can then be accessed with `params.<your_parameter>`
+-
+-Helper scripts to run experiments are in `py/`
+----------------------------------------------
+-This can be useful if:
+-* You are running many experiments in parallel.
+-* You want to easily generate configuration files.
+-
+-To compile, the Automake and Autoconf files are included: `configure.ac` and `Makefile.am`. The makefile will produce two targets: `simulator` and `simdebug`. 
+-`simdebug` is equivalent to `simulator`, except compiler optimzations are turned off to make debugging easier.
+-
+-Authors
+--------
+-
+-* Gautam Kumar
+-* Akshay Narayan
+-* Peter Gao
+-
+-![Our Project Mascot](yaps-mascot.png)
+-
+diff --git a/coresim/event.cpp b/coresim/event.cpp
+index 336bc8d..d918966 100644
+--- a/coresim/event.cpp
++++ b/coresim/event.cpp
+@@ -17,6 +17,9 @@
+ 
+ #include "../run/params.h"
+ 
++#include "ext/flowsizeoracle.h"
++
++
+ extern Topology* topology;
+ extern std::priority_queue<Event*, std::vector<Event*>, EventComparator> event_queue;
+ extern double current_time;
+@@ -52,6 +55,9 @@ extern int get_event_queue_size();
+ 
+ uint32_t Event::instance_count = 0;
+ 
++extern FlowSizeOracle* flow_size_oracle;
++
++
+ Event::Event(uint32_t type, double time) {
+     this->type = type;
+     this->time = time;
+@@ -114,6 +120,16 @@ void FlowCreationForInitializationEvent::process_event() {
+ }
+ 
+ 
++/* Flow Oracle Triggering */
++TriggerFlowOracleEvent::TriggerFlowOracleEvent(double time) : Event(TRIGGER_FLOW_ORACLE, time) {
++}
++
++TriggerFlowOracleEvent::~TriggerFlowOracleEvent() {
++}
++
++void TriggerFlowOracleEvent::process_event() {
++	flow_size_oracle->update_size_threshold();
++}
+ /* Flow Arrival */
+ int flow_arrival_count = 0;
+ 
+@@ -140,6 +156,7 @@ void FlowArrivalEvent::process_event() {
+         flow_arrivals.pop_front();
+     }
+ 
++
+     if(params.num_flows_to_run > 10 && flow_arrival_count % 100000 == 0){
+         double curr_time = get_current_time();
+         uint32_t num_unfinished_flows = 0;
+@@ -315,6 +332,7 @@ void FlowFinishedEvent::process_event() {
+         std::cout
+             << flow->id << " "
+             << flow->size << " "
++            << flow->size_in_pkt << " "
+             << flow->src->id << " "
+             << flow->dst->id << " "
+             << 1000000 * flow->start_time << " "
+diff --git a/coresim/event.h b/coresim/event.h
+index f1f2b0d..8f76d1a 100644
+--- a/coresim/event.h
++++ b/coresim/event.h
+@@ -28,6 +28,7 @@
+ #define FLOW_PROCESSING 7
+ #define FLOW_CREATION_EVENT 8
+ #define LOGGING 9
++#define TRIGGER_FLOW_ORACLE 10
+ 
+ class Event {
+     public:
+@@ -95,6 +96,14 @@ class FlowArrivalEvent : public Event {
+         Flow *flow;
+ };
+ 
++//A flow arrival event
++class TriggerFlowOracleEvent: public Event {
++    public:
++        TriggerFlowOracleEvent(double time);
++        ~TriggerFlowOracleEvent();
++        void process_event();
++};
++
+ // packet gets queued
+ class PacketQueuingEvent : public Event {
+     public:
+diff --git a/coresim/flow.cpp b/coresim/flow.cpp
+index 288ce10..39c546c 100644
+--- a/coresim/flow.cpp
++++ b/coresim/flow.cpp
+@@ -8,6 +8,9 @@
+ 
+ #include "../run/params.h"
+ 
++#include "ext/flowsizeoracle.h"
++
++
+ extern double get_current_time(); 
+ extern void add_to_event_queue(Event *);
+ extern int get_event_queue_size();
+@@ -15,6 +18,8 @@ extern DCExpParams params;
+ extern uint32_t num_outstanding_packets;
+ extern uint32_t max_outstanding_packets;
+ extern uint32_t duplicated_packets_received;
++extern FlowSizeOracle* flow_size_oracle;
++
+ 
+ Flow::Flow(uint32_t id, double start_time, uint32_t size, Host *s, Host *d) {
+     this->id = id;
+@@ -53,6 +58,8 @@ Flow::Flow(uint32_t id, double start_time, uint32_t size, Host *s, Host *d) {
+     this->first_byte_receive_time = -1;
+     this->first_hop_departure = 0;
+     this->last_hop_departure = 0;
++    //flow_size_oracle->add_flow(this);
++
+ }
+ 
+ Flow::~Flow() {
+diff --git a/coresim/main.cpp b/coresim/main.cpp
+index 025808e..fef8a8f 100644
+--- a/coresim/main.cpp
++++ b/coresim/main.cpp
+@@ -20,6 +20,9 @@
+ 
+ #include "../run/params.h"
+ 
++#include "../ext/flowsizeoracle.h"
++
++
+ using namespace std;
+ 
+ Topology* topology;
+@@ -50,6 +53,9 @@ uint32_t sent_packets = 0;
+ extern DCExpParams params;
+ double start_time = -1;
+ 
++FlowSizeOracle* flow_size_oracle;
++
++
+ const std::string currentDateTime() {
+     time_t     now = time(0);
+     struct tm  tstruct;
+@@ -120,7 +126,8 @@ int main (int argc, char ** argv) {
+     time(&start_time);
+ 
+     //srand(time(NULL));
+-    srand(0);
++    srand(atoi(argv[3]));
++    //srand(0);
+     std::cout.precision(15);
+ 
+     uint32_t exp_type = atoi(argv[1]);
+diff --git a/coresim/random_variable.cpp b/coresim/random_variable.cpp
+index 40f1ea9..5d46e79 100644
+--- a/coresim/random_variable.cpp
++++ b/coresim/random_variable.cpp
+@@ -93,7 +93,7 @@ int EmpiricalRandomVariable::lookup(double u) {
+ }
+ 
+ int EmpiricalRandomVariable::loadCDF(std::string filename) {
+-  assert(false);
++  //assert(false);
+   std::string line;
+   std::ifstream myfile(filename);
+   assert(myfile.good());
+diff --git a/ext/factory.cpp b/ext/factory.cpp
+index 372022f..f6d0aee 100644
+--- a/ext/factory.cpp
++++ b/ext/factory.cpp
+@@ -21,6 +21,8 @@
+ 
+ #include "ideal.h"
+ 
++#include "modelflow.h"
++
+ IdealArbiter* ideal_arbiter = NULL;
+ 
+ /* Factory method to return appropriate queue */
+@@ -76,6 +78,10 @@ Flow* Factory::get_flow(
+         case PFABRIC_FLOW:
+             return new PFabricFlow(id, start_time, size, src, dst);
+             break;
++        case MODEL_FLOW:
++            return new ModelFlow(id, start_time, size, src, dst);
++            break;
++
+         case CAPABILITY_FLOW:
+             return new CapabilityFlow(id, start_time, size, src, dst);
+             break;
+diff --git a/ext/factory.h b/ext/factory.h
+index 116a734..f603d0a 100644
+--- a/ext/factory.h
++++ b/ext/factory.h
+@@ -14,6 +14,7 @@
+ /* Flow types */
+ #define NORMAL_FLOW 1
+ #define PFABRIC_FLOW 2
++#define MODEL_FLOW 3
+ #define VANILLA_TCP_FLOW 42
+ #define DCTCP_FLOW 43
+ #define CAPABILITY_FLOW 112
+diff --git a/ext/flowsizeoracle.cpp b/ext/flowsizeoracle.cpp
+new file mode 100644
+index 0000000..c1ef879
+--- /dev/null
++++ b/ext/flowsizeoracle.cpp
+@@ -0,0 +1,67 @@
++#include "flowsizeoracle.h"
++#include <algorithm>
++#include <bits/stdint-uintn.h>
++#include <cassert>
++#include <cmath>
++#include <cstdint>
++#include <cstdlib>
++#include <vector>
++#include <iostream>
++#include <stdlib.h>
++
++void FlowSizeOracle::add_flow(Flow *flow) {
++	// if the flow is not present
++	if (this->flow_map.find(flow->id) == this->flow_map.end()) {
++		this->flow_map.insert(std::pair<uint32_t,uint32_t>(flow->id, flow->size_in_pkt));
++		//update_size_threshold();
++	}
++}
++
++void FlowSizeOracle::update_size_threshold() {
++	std::vector<uint32_t> temp;
++	for (auto i = this->flow_map.begin(); i != this->flow_map.end(); i++) {
++		if (i->second >= this->packet_cache_limit)
++			temp.push_back(i->second);
++	}
++	if (temp.size() > 0) {
++		std::sort(temp.begin(), temp.end());
++		uint32_t threshold_index = uint32_t(floor(1.0+(this->quantile*(temp.size()-1.0))));
++		threshold_index -= 1;
++		this->size_threshold = temp[threshold_index];
++	}
++	//std::cout << "New size threshold " << this->size_threshold << std::endl;
++	//std::cout << temp.size() << std::endl;
++}
++
++//uint8_t FlowSizeOracle::query_flow(Flow *flow) {
++//	auto temp = this->flow_map.find(flow->id);
++//	assert(temp != this->flow_map.end());
++//	auto ret =  ((temp->second >= this->size_threshold) ? 1 : 0);
++//	double rand_val =  ((double) rand() / (RAND_MAX));
++//	double hh_rand_val = ((double) rand() / (RAND_MAX));
++//	if (ret == 1 && ((rand_val > hh_tp_rate) || (hh_rand_val > hh_reaching_model_perc))) {
++//		ret = 0;
++//	}
++//	if (ret == 0 && rand_val > mice_tp_rate) {
++//		ret = 1;
++//	}
++//	return ret;
++//}
++
++uint8_t FlowSizeOracle::query_flow(Flow *flow) {
++	auto temp = this->flow_map.find(flow->id);
++	assert(temp != this->flow_map.end());
++	if (temp->second < this->packet_cache_limit)
++		return 0;
++	auto ret =  ((temp->second >= this->size_threshold) ? 2 : 1);
++	double rand_val =  ((double) rand() / (RAND_MAX));
++	double hh_rand_val = ((double) rand() / (RAND_MAX));
++	//if (ret == 2 && ((rand_val > hh_tp_rate) || (hh_rand_val > hh_reaching_model_perc))) {
++	if (ret == 2 && (rand_val > hh_tp_rate)) {
++		ret = 1;
++	}
++	if (ret == 1 && (rand_val > mice_tp_rate)) {
++		ret = 2;
++	}
++	return ret;
++}
+diff --git a/ext/flowsizeoracle.h b/ext/flowsizeoracle.h
+new file mode 100644
+index 0000000..6db0a0c
+--- /dev/null
++++ b/ext/flowsizeoracle.h
+@@ -0,0 +1,34 @@
++#ifndef FLOW_SIZE_ORACLE_H
++#define FLOW_SIZE_ORACLE_H
++
++#include "coresim/flow.h"
++#include <bits/stdint-uintn.h>
++#include <cstdint>
++#include <map>
++#include <vector>
++
++using namespace std;
++
++class FlowSizeOracle {
++	private:
++	// map flow_id -> size
++	map<uint32_t, uint32_t> flow_map;
++	// update size threshold whenever a new flow is added 
++	uint32_t size_threshold;
++	float quantile;
++	float hh_tp_rate;
++	float mice_tp_rate;
++	const float hh_reaching_model_perc = 0.8;
++	uint32_t packet_cache_limit;
++
++	public:
++	FlowSizeOracle(float quantile, float hh_tp_rate, float mice_tp_rate, uint32_t packet_cache_limit): quantile(quantile), hh_tp_rate(hh_tp_rate), mice_tp_rate(mice_tp_rate), packet_cache_limit(packet_cache_limit) {
++		size_threshold = 0;
++	}
++	// add flow to the flow list
++	void add_flow(Flow* flow);
++	void update_size_threshold();
++	uint8_t query_flow(Flow* flow);
++};
++
++#endif
+diff --git a/ext/modelflow.cpp b/ext/modelflow.cpp
+new file mode 100644
+index 0000000..6672307
+--- /dev/null
++++ b/ext/modelflow.cpp
+@@ -0,0 +1,67 @@
++#include "modelflow.h"
++#include "ext/flowsizeoracle.h"
++#include "ext/pfabricflow.h"
++#include <iostream>
++
++#include "ext/flowsizeoracle.h"
++#include "../coresim/flow.h"
++#include "../coresim/packet.h"
++#include "../coresim/event.h"
++
++#include "../run/params.h"
++
++extern FlowSizeOracle* flow_size_oracle;
++extern double get_current_time(); 
++extern void add_to_event_queue(Event *);
++extern DCExpParams params;
++/* Implementation for pFabric Flow */
++
++ModelFlow::ModelFlow(uint32_t id, double start_time, uint32_t size, Host *s, Host *d)
++	: PFabricFlow(id, start_time, size, s, d) {
++		oracle_priority_set = false;
++		oracle_priority = 0;
++		sent_packet_count = 0;
++    		flow_size_oracle->add_flow(this);
++	}
++
++
++uint32_t ModelFlow::get_priority(uint32_t packet_count) {
++	if (packet_count < params.packet_cache_limit) 
++		return 0;
++	if (!oracle_priority_set) {
++		oracle_priority = flow_size_oracle->query_flow(this);
++		//std::cout << "maybe here " << oracle_priority << " no" << std::endl;
++		oracle_priority_set = true;
++	}
++	//std::cout << "Flow ID " << this->id << " Priority " << oracle_priority << std::endl;
++	return oracle_priority;
++}
++
++Packet* ModelFlow::send(uint32_t seq) {
++	//0 if less then r
++	Packet *p = NULL;
++	sent_packet_count++;
++
++	uint32_t pkt_size;
++	// last packet
++	if (seq + mss > this->size) {
++		pkt_size = this->size - seq + hdr_size;
++	} else {
++		pkt_size = mss + hdr_size;
++	}
++
++	uint32_t priority = get_priority(sent_packet_count);
++	p = new Packet(
++			get_current_time(), 
++			this, 
++			seq, 
++			priority, 
++			pkt_size, 
++			src, 
++			dst
++		      );
++	this->total_pkt_sent++;
++
++	add_to_event_queue(new PacketQueuingEvent(get_current_time(), p, src->queue));
++	return p;
++}
+diff --git a/ext/modelflow.h b/ext/modelflow.h
+new file mode 100644
+index 0000000..73fbb65
+--- /dev/null
++++ b/ext/modelflow.h
+@@ -0,0 +1,19 @@
++#ifndef MODEL_FLOW_H
++#define MODEL_FLOW_H
++
++#include "pfabricflow.h"
++#include "../coresim/node.h"
++#include <bits/stdint-uintn.h>
++
++class ModelFlow : public PFabricFlow {
++	private:
++		bool oracle_priority_set;
++		uint32_t oracle_priority;
++		uint32_t sent_packet_count; 
++	public:
++		ModelFlow(uint32_t id, double start_time, uint32_t size, Host *s, Host *d);
++        	virtual uint32_t get_priority(uint32_t seq);
++        	virtual Packet *send(uint32_t seq);
++};
++
++#endif
+diff --git a/py/compute_avg_slowdown.py b/py/compute_avg_slowdown.py
+new file mode 100755
+index 0000000..fb707fd
+--- /dev/null
++++ b/py/compute_avg_slowdown.py
+@@ -0,0 +1,61 @@
++#!/usr/bin/python
++
++import argparse
++import numpy as np
++
++parser = argparse.ArgumentParser()
++parser.add_argument("--file", required=True, type=str)
++
++args = parser.parse_args()
++
++avg_slowdown = 0.0
++count = 0
++sizes = []
++
++with open(args.file, "r") as f:
++    lines = f.readlines()
++    size = len(lines)
++    for line in lines[:-1]:
++        rec = line.split(" ")
++        if rec[0] == "Flow" or rec[0] == "unfinished" or rec[0] == "Ended" or rec[0] == "##":
++            continue
++        count += 1
++        slowdown = float(rec[9])
++        avg_slowdown += slowdown
++        size_in_pkt = int(rec[2])
++        sizes.append(size_in_pkt)
++
++sizes = np.array(sizes)
++thres = np.quantile(sizes, 0.99)
++#print(thres)
++
++avg_slowdown_mice = 0.0
++mice_count = 0
++avg_slowdown_hh = 0.0
++hh_count = 0
++
++with open(args.file, "r") as f:
++    lines = f.readlines()
++    size = len(lines)
++    for line in lines[:-1]:
++        rec = line.split(" ")
++        if rec[0] == "Flow" or rec[0] == "unfinished" or rec[0] == "Ended" or rec[0] == "##":
++            continue
++        slowdown = float(rec[9])
++        size_in_pkt = int(rec[2])
++        if size_in_pkt >= thres:
++            avg_slowdown_hh += slowdown
++            hh_count += 1
++        else:
++            avg_slowdown_mice += slowdown
++            mice_count += 1
++try:
++    print(avg_slowdown/count, avg_slowdown_hh/hh_count, avg_slowdown_mice/mice_count)
++except ZeroDivisionError:
++    try:
++        print(avg_slowdown/count, avg_slowdown_hh/hh_count, 0)
++    except ZeroDivisionError:
++        try:
++            print(avg_slowdown/count, 0, avg_slowdown_mice/mice_count)
++        except ZeroDivisionError:       
++            print(avg_slowdown/count, 0, 0)
+\ No newline at end of file
+diff --git a/py/compute_median.py b/py/compute_median.py
+new file mode 100644
+index 0000000..0bf7beb
+--- /dev/null
++++ b/py/compute_median.py
+@@ -0,0 +1,17 @@
++#!/usr/bin/python3
++import argparse
++import numpy as np
++
++parser = argparse.ArgumentParser()
++parser.add_argument("--file",type=str, required=True)
++args = parser.parse_args()
++
++val_array = []
++
++with open(args.file, "r") as f:
++    for line in f.readlines():
++        val_array.append(float(line.strip()))
++
++val_array = np.array(val_array)
++print(np.median(val_array))
++print(np.mean(val_array))
+diff --git a/py/run_experiments.py b/py/run_experiments.py
+deleted file mode 100644
+index 26ba40f..0000000
+--- a/py/run_experiments.py
++++ /dev/null
+@@ -1,194 +0,0 @@
+-#!/usr/bin/python
+-
+-import subprocess
+-import threading
+-import multiprocessing
+-
+-conf_str_pfabric = '''init_cwnd: 12
+-max_cwnd: 15
+-retx_timeout: 45e-06
+-queue_size: 36864
+-propagation_delay: 0.0000002
+-bandwidth: 40000000000.0
+-queue_type: 2
+-flow_type: 2
+-num_flow: {0}
+-flow_trace: ./{1}
+-cut_through: 1
+-mean_flow_size: 0
+-load_balancing: 0
+-preemptive_queue: 0
+-big_switch: 0
+-host_type: 1
+-traffic_imbalance: 0
+-load: 0.6
+-reauth_limit: 3
+-magic_trans_slack: 1.1
+-magic_delay_scheduling: 1
+-use_flow_trace: 0
+-smooth_cdf: 1
+-burst_at_beginning: 0
+-capability_timeout: 1.5
+-capability_resend_timeout: 9
+-capability_initial: 8
+-capability_window: 8
+-capability_window_timeout: 25
+-ddc: 0
+-ddc_cpu_ratio: 0.33
+-ddc_mem_ratio: 0.33
+-ddc_disk_ratio: 0.34
+-ddc_normalize: 2
+-ddc_type: 0
+-deadline: 0
+-schedule_by_deadline: 0
+-avg_deadline: 0.0001
+-capability_third_level: 1
+-capability_fourth_level: 0
+-magic_inflate: 1
+-interarrival_cdf: none
+-num_host_types: 13
+-permutation_tm: 1
+-
+-'''
+-
+-conf_str_phost = '''init_cwnd: 2
+-max_cwnd: 6
+-retx_timeout: 9.50003e-06
+-queue_size: 36864
+-propagation_delay: 0.0000002
+-bandwidth: 40000000000.0
+-queue_type: 2
+-flow_type: 112
+-num_flow: {0}
+-flow_trace: ./{1}
+-cut_through: 1
+-mean_flow_size: 0
+-load_balancing: 0
+-preemptive_queue: 0
+-big_switch: 0
+-host_type: 12
+-traffic_imbalance: 0
+-load: 0.6
+-reauth_limit: 3
+-magic_trans_slack: 1.1
+-magic_delay_scheduling: 1
+-use_flow_trace: 0
+-smooth_cdf: 1
+-burst_at_beginning: 0
+-capability_timeout: 1.5
+-capability_resend_timeout: 9
+-capability_initial: 8
+-capability_window: 8
+-capability_window_timeout: 25
+-ddc: 0
+-ddc_cpu_ratio: 0.33
+-ddc_mem_ratio: 0.33
+-ddc_disk_ratio: 0.34
+-ddc_normalize: 2
+-ddc_type: 0
+-deadline: 0
+-schedule_by_deadline: 0
+-avg_deadline: 0.0001
+-capability_third_level: 1
+-capability_fourth_level: 0
+-magic_inflate: 1
+-interarrival_cdf: none
+-num_host_types: 13
+-permutation_tm: 1
+-
+-'''
+-
+-conf_str_fastpass = '''init_cwnd: 6
+-max_cwnd: 12
+-retx_timeout: 45e-06
+-queue_size: 36864
+-propagation_delay: 0.0000002
+-bandwidth: 40000000000.0
+-queue_type: 2
+-flow_type: 114
+-num_flow: {0}
+-flow_trace: ./{1}
+-cut_through: 1
+-mean_flow_size: 0
+-load_balancing: 0
+-preemptive_queue: 0
+-big_switch: 0
+-host_type: 14
+-traffic_imbalance: 0
+-load: 0.6
+-reauth_limit: 3
+-magic_trans_slack: 1.1
+-magic_delay_scheduling: 1
+-use_flow_trace: 0
+-smooth_cdf: 1
+-burst_at_beginning: 0
+-capability_timeout: 1.5
+-capability_resend_timeout: 9
+-capability_initial: 8
+-capability_window: 8
+-capability_window_timeout: 25
+-ddc: 0
+-ddc_cpu_ratio: 0.33
+-ddc_mem_ratio: 0.33
+-ddc_disk_ratio: 0.34
+-ddc_normalize: 2
+-ddc_type: 0
+-deadline: 0
+-schedule_by_deadline: 0
+-avg_deadline: 0.0001
+-capability_third_level: 1
+-capability_fourth_level: 0
+-magic_inflate: 1
+-interarrival_cdf: none
+-num_host_types: 13
+-permutation_tm: 1
+-
+-'''
+-
+-
+-template = '../simulator 1 conf_{0}_{1}.txt > result_{0}_{1}.txt'
+-cdf_temp = './CDF_{}.txt'
+-
+-runs = ['pfabric', 'phost', 'fastpass']
+-workloads = ['aditya', 'dctcp', 'datamining']
+-
+-def getNumLines(trace):
+-    out = subprocess.check_output('wc -l {}'.format(trace), shell=True)
+-    return int(out.split()[0])
+-
+-
+-def run_exp(rw, semaphore):
+-    semaphore.acquire()
+-    print template.format(*rw)
+-    subprocess.call(template.format(*rw), shell=True)
+-    semaphore.release()
+-
+-threads = []
+-semaphore = threading.Semaphore(multiprocessing.cpu_count())
+-
+-for r in runs:
+-    for w in workloads:
+-        cdf = cdf_temp.format(w)
+-        numLines = 1000000
+-
+-        #  generate conf file
+-        if r == 'pfabric':
+-            conf_str = conf_str_pfabric.format(numLines, cdf)
+-        elif r == 'phost':
+-            conf_str = conf_str_phost.format(numLines, cdf)
+-        elif r == 'fastpass':
+-            conf_str = conf_str_fastpass.format(numLines, cdf)
+-        else:
+-            assert False, r
+-
+-        confFile = "conf_{0}_{1}.txt".format(r, w)
+-        with open(confFile, 'w') as f:
+-            print confFile
+-            f.write(conf_str)
+-
+-        threads.append(threading.Thread(target=run_exp, args=((r, w), semaphore)))
+-
+-print '\n'
+-[t.start() for t in threads]
+-[t.join() for t in threads]
+-print 'finished', len(threads), 'experiments'
+diff --git a/py/run_experiments_caida.py b/py/run_experiments_caida.py
+new file mode 100755
+index 0000000..3f957d2
+--- /dev/null
++++ b/py/run_experiments_caida.py
+@@ -0,0 +1,375 @@
++#!/usr/bin/python2
++
++import subprocess
++import threading
++import multiprocessing
++import argparse
++
++
++conf_str_coda = '''init_cwnd: 12
++max_cwnd: 15
++retx_timeout: 45e-06
++queue_size: 36864
++propagation_delay: 0.0000002
++bandwidth: 40000000000.0
++queue_type: 2
++flow_type: 3
++num_flow: {0}
++flow_trace: ./{1}
++cut_through: 1
++mean_flow_size: 0
++load_balancing: 0
++preemptive_queue: 0
++big_switch: 0
++host_type: 1
++traffic_imbalance: 0
++load: {2}
++reauth_limit: 3
++magic_trans_slack: 1.1
++magic_delay_scheduling: 1
++use_flow_trace: 0
++smooth_cdf: 1
++burst_at_beginning: 0
++capability_timeout: 1.5
++capability_resend_timeout: 9
++capability_initial: 8
++capability_window: 8
++capability_window_timeout: 25
++ddc: 0
++ddc_cpu_ratio: 0.33
++ddc_mem_ratio: 0.33
++ddc_disk_ratio: 0.34
++ddc_normalize: 2
++ddc_type: 0
++deadline: 0
++schedule_by_deadline: 0
++avg_deadline: 0.0001
++capability_third_level: 1
++capability_fourth_level: 0
++magic_inflate: 1
++interarrival_cdf: none
++num_host_types: 13
++hh_tp_rate: {3}
++mice_tp_rate: {4}
++hh_percentage: 0.99
++permutation_tm: 1
++packet_cache_limit: 5
++'''
++
++conf_str_pheavy = '''init_cwnd: 12
++max_cwnd: 15
++retx_timeout: 45e-06
++queue_size: 36864
++propagation_delay: 0.0000002
++bandwidth: 40000000000.0
++queue_type: 2
++flow_type: 3
++num_flow: {0}
++flow_trace: ./{1}
++cut_through: 1
++mean_flow_size: 0
++load_balancing: 0
++preemptive_queue: 0
++big_switch: 0
++host_type: 1
++traffic_imbalance: 0
++load: {2}
++reauth_limit: 3
++magic_trans_slack: 1.1
++magic_delay_scheduling: 1
++use_flow_trace: 0
++smooth_cdf: 1
++burst_at_beginning: 0
++capability_timeout: 1.5
++capability_resend_timeout: 9
++capability_initial: 8
++capability_window: 8
++capability_window_timeout: 25
++ddc: 0
++ddc_cpu_ratio: 0.33
++ddc_mem_ratio: 0.33
++ddc_disk_ratio: 0.34
++ddc_normalize: 2
++ddc_type: 0
++deadline: 0
++schedule_by_deadline: 0
++avg_deadline: 0.0001
++capability_third_level: 1
++capability_fourth_level: 0
++magic_inflate: 1
++interarrival_cdf: none
++num_host_types: 13
++hh_tp_rate: {3}
++mice_tp_rate: {4}
++hh_percentage: 0.99
++permutation_tm: 1
++packet_cache_limit: 5
++'''
++
++conf_str_fifo = '''init_cwnd: 12
++max_cwnd: 15
++retx_timeout: 45e-06
++queue_size: 36864
++propagation_delay: 0.0000002
++bandwidth: 40000000000.0
++queue_type: 1
++flow_type: 1
++num_flow: {0}
++flow_trace: ./{1}
++cut_through: 1
++mean_flow_size: 0
++load_balancing: 0
++preemptive_queue: 0
++big_switch: 0
++host_type: 1
++traffic_imbalance: 0
++load: {2}
++reauth_limit: 3
++magic_trans_slack: 1.1
++magic_delay_scheduling: 1
++use_flow_trace: 0
++smooth_cdf: 1
++burst_at_beginning: 0
++capability_timeout: 1.5
++capability_resend_timeout: 9
++capability_initial: 8
++capability_window: 8
++capability_window_timeout: 25
++ddc: 0
++ddc_cpu_ratio: 0.33
++ddc_mem_ratio: 0.33
++ddc_disk_ratio: 0.34
++ddc_normalize: 2
++ddc_type: 0
++deadline: 0
++schedule_by_deadline: 0
++avg_deadline: 0.0001
++capability_third_level: 1
++capability_fourth_level: 0
++magic_inflate: 1
++interarrival_cdf: none
++num_host_types: 13
++permutation_tm: 1
++'''
++
++conf_str_pfabric = '''init_cwnd: 12
++max_cwnd: 15
++retx_timeout: 45e-06
++queue_size: 36864
++propagation_delay: 0.0000002
++bandwidth: 40000000000.0
++queue_type: 2
++flow_type: 2
++num_flow: {0}
++flow_trace: ./{1}
++cut_through: 1
++mean_flow_size: 0
++load_balancing: 0
++preemptive_queue: 0
++big_switch: 0
++host_type: 1
++traffic_imbalance: 0
++load: {2}
++reauth_limit: 3
++magic_trans_slack: 1.1
++magic_delay_scheduling: 1
++use_flow_trace: 0
++smooth_cdf: 1
++burst_at_beginning: 0
++capability_timeout: 1.5
++capability_resend_timeout: 9
++capability_initial: 8
++capability_window: 8
++capability_window_timeout: 25
++ddc: 0
++ddc_cpu_ratio: 0.33
++ddc_mem_ratio: 0.33
++ddc_disk_ratio: 0.34
++ddc_normalize: 2
++ddc_type: 0
++deadline: 0
++schedule_by_deadline: 0
++avg_deadline: 0.0001
++capability_third_level: 1
++capability_fourth_level: 0
++magic_inflate: 1
++interarrival_cdf: none
++num_host_types: 13
++permutation_tm: 1
++'''
++
++conf_str_phost = '''init_cwnd: 2
++max_cwnd: 6
++retx_timeout: 9.50003e-06
++queue_size: 36864
++propagation_delay: 0.0000002
++bandwidth: 40000000000.0
++queue_type: 2
++flow_type: 112
++num_flow: {0}
++flow_trace: ./{1}
++cut_through: 1
++mean_flow_size: 0
++load_balancing: 0
++preemptive_queue: 0
++big_switch: 0
++host_type: 12
++traffic_imbalance: 0
++load: {2}
++reauth_limit: 3
++magic_trans_slack: 1.1
++magic_delay_scheduling: 1
++use_flow_trace: 0
++smooth_cdf: 1
++burst_at_beginning: 0
++capability_timeout: 1.5
++capability_resend_timeout: 9
++capability_initial: 8
++capability_window: 8
++capability_window_timeout: 25
++ddc: 0
++ddc_cpu_ratio: 0.33
++ddc_mem_ratio: 0.33
++ddc_disk_ratio: 0.34
++ddc_normalize: 2
++ddc_type: 0
++deadline: 0
++schedule_by_deadline: 0
++avg_deadline: 0.0001
++capability_third_level: 1
++capability_fourth_level: 0
++magic_inflate: 1
++interarrival_cdf: none
++num_host_types: 13
++permutation_tm: 1
++'''
++
++def getNumLines(trace):
++    out = subprocess.check_output('wc -l {}'.format(trace), shell=True)
++    return int(out.split()[0])
++
++def run_exp(rw, semaphore, seed):
++    semaphore.acquire()
++    (a, b, c) = rw
++    print template.format(a,b,c,seed)
++    subprocess.call(template.format(a,b,c,seed), shell=True)
++    semaphore.release()
++
++template = '../simulator 1 caida/conf_{0}_{1}_{2}.txt {3} > caida/result_{0}_{1}_{2}.txt'
++cdf_temp = './CDF_{}.txt'
++loads = [0.5, 0.8]
++runs = [
++    'coda', 
++    'pfabric', 
++    'phost', 
++    'fifo', 
++    'pheavy'
++]
++workloads = ['caida']
++threads = []
++started_threads = []
++semaphore = threading.Semaphore(multiprocessing.cpu_count())
++numLines = 1000000 # num flows
++iterations = 1
++
++
++def main(args):
++    for it in range(iterations):
++        threads = []
++        for l in loads:
++            for r in runs:
++                for w in workloads:
++                    cdf = cdf_temp.format(w)
++            
++                    #  generate conf file
++                    if r == 'pfabric':
++                        conf_str = conf_str_pfabric.format(numLines, cdf, l)
++                    elif r == 'coda':
++                        conf_str = conf_str_coda.format(numLines, cdf, l, args.tpr_dumbo, args.tnr_dumbo)
++                    elif r == 'pheavy':
++                        conf_str = conf_str_pheavy.format(numLines, cdf, l, args.tpr_pheavy, args.tnr_pheavy)
++                    elif r == 'fifo':
++                        conf_str = conf_str_fifo.format(numLines, cdf, l)
++                    elif r == 'phost':
++                        conf_str = conf_str_phost.format(numLines, cdf, l)
++                    else:
++                        assert False, r
++            
++                    confFile = "caida/conf_{0}_{1}_{2}.txt".format(r, w, l)
++                    with open(confFile, 'w') as f:
++                        print confFile
++                        f.write(conf_str)
++            
++                    threads.append(threading.Thread(target=run_exp, args=((r, w, l), semaphore, it)))
++        
++        print '\n'
++        
++        max_threads = 10
++        while len(threads) > 0:
++            if threading.active_count() < max_threads:
++                thread = threads.pop()
++                thread.start()
++                started_threads.append(thread)
++            else:
++                [t.join() for t in started_threads]
++        
++        [t.join() for t in started_threads]
++        print 'finished', len(started_threads), 'experiments'
++        
++        # process results 
++        
++        for r in runs:
++            for w in workloads:
++                result_file = 'caida/result_{0}_{1}_{2}.txt'.format(r,w,it)
++                with open(result_file, "w") as f:
++                    for l in loads:
++                        output = subprocess.check_output("./compute_avg_slowdown.py --file caida/result_{0}_{1}_{2}.txt".format(r, w, l), shell=True)
++                        f.write("{} {}".format(l,output))
++                        subprocess.check_output("rm caida/result_{0}_{1}_{2}.txt".format(r, w, l), shell=True)
++
++    for r in runs:
++        for w in workloads:
++            suff = ""
++            if numLines == 10000:
++                suff = "10K"
++            if numLines == 100000:
++                suff = "100K"
++            if numLines == 1000000:
++                suff = "1M"
++            if numLines == 10000000:
++                suff = "10M"
++            out_file_name = 'result_{0}_{1}_{2}.txt'.format(r, w, suff)
++            out_file = open(out_file_name,"w")
++            avg_slowdown = {}
++            mice_slowdown = {}
++            eleph_slowdown = {}
++            for l in loads:
++                avg_slowdown[l] = 0.0
++                mice_slowdown[l] = 0.0
++                eleph_slowdown[l] = 0.0
++            for it in range(iterations):
++                result_file = 'caida/result_{0}_{1}_{2}.txt'.format(r,w,it)
++                with open(result_file, "r") as f:
++                    for line in f.readlines():
++                        rec = line.split(" ")
++                        load = float(rec[0])
++                        avg_slowdown[load] += float(rec[1])
++                        eleph_slowdown[load] += float(rec[2])
++                        mice_slowdown[load] += float(rec[3])
++            for l in loads:
++                avg_slowdown[l] /= iterations
++                mice_slowdown[l] /= iterations
++                eleph_slowdown[l] /= iterations
++                out_file.write("{} {} {} {}\n".format(l,avg_slowdown[l],eleph_slowdown[l],mice_slowdown[l]))
++            
++
++if __name__ == "__main__":
++    
++    argparser = argparse.ArgumentParser()
++    argparser.add_argument("--tpr-dumbo", help="DUMBO True Positive Rate (for performance simulation)", type=float, required=True)
++    argparser.add_argument("--tnr-dumbo", help="DUMBO True Negative Rate (for performance simulation)", type=float, required=True)
++    argparser.add_argument("--tpr-pheavy", help="pHeavy True Positive Rate (for performance simulation)", type=float, required=True)
++    argparser.add_argument("--tnr-pheavy", help="pHeavy True Negative Rate (for performance simulation)", type=float, required=True)
++    args = argparser.parse_args()
++
++    main(args)
+\ No newline at end of file
+diff --git a/py/run_experiments_caida_synth.py b/py/run_experiments_caida_synth.py
+new file mode 100755
+index 0000000..740ec1e
+--- /dev/null
++++ b/py/run_experiments_caida_synth.py
+@@ -0,0 +1,175 @@
++#!/usr/bin/python2
++
++import subprocess
++import threading
++import multiprocessing
++import pandas as pd
++import argparse
++
++
++conf_str_synth = '''init_cwnd: 12
++max_cwnd: 15
++retx_timeout: 45e-06
++queue_size: 36864
++propagation_delay: 0.0000002
++bandwidth: 40000000000.0
++queue_type: 2
++flow_type: 3
++num_flow: {0}
++flow_trace: ./{1}
++cut_through: 1
++mean_flow_size: 0
++load_balancing: 0
++preemptive_queue: 0
++big_switch: 0
++host_type: 1
++traffic_imbalance: 0
++load: {2}
++reauth_limit: 3
++magic_trans_slack: 1.1
++magic_delay_scheduling: 1
++use_flow_trace: 0
++smooth_cdf: 1
++burst_at_beginning: 0
++capability_timeout: 1.5
++capability_resend_timeout: 9
++capability_initial: 8
++capability_window: 8
++capability_window_timeout: 25
++ddc: 0
++ddc_cpu_ratio: 0.33
++ddc_mem_ratio: 0.33
++ddc_disk_ratio: 0.34
++ddc_normalize: 2
++ddc_type: 0
++deadline: 0
++schedule_by_deadline: 0
++avg_deadline: 0.0001
++capability_third_level: 1
++capability_fourth_level: 0
++magic_inflate: 1
++interarrival_cdf: none
++num_host_types: 13
++hh_tp_rate: {3}
++mice_tp_rate: {4}
++hh_percentage: 0.99
++permutation_tm: 1
++packet_cache_limit: 5
++'''
++
++def getNumLines(trace):
++    out = subprocess.check_output('wc -l {}'.format(trace), shell=True)
++    return int(out.split()[0])
++
++def run_exp(rw, semaphore, seed, tpr, tnr):
++    semaphore.acquire()
++    (a, b, c) = rw
++    print template.format(a, b, c, seed, tpr, tnr)
++    subprocess.call(template.format(a, b, c, seed, tpr, tnr), shell=True)
++    semaphore.release()
++
++def get_synth_mispred_rates(path="./CAIDA_135000.all.0.02_fnr_to_fpr.csv"):
++    df = pd.read_csv(path)
++    df["tpr"] = 1.0 - df["fnr"]
++    df["tnr"] = 1.0 - df["fpr"]
++    rates = {
++        "tpr": df["tpr"].tolist(), 
++        "tnr": df["tnr"].tolist(), 
++    }
++    return rates    
++
++template = '../simulator 1 synth/conf_{0}_{1}_{2}_{4}tpr_{5}tnr.txt {3} > synth/result_{0}_{1}_{2}_{4}tpr_{5}tnr.txt'
++cdf_temp = './CDF_{}.txt'
++loads = [0.8]
++runs = ['synth']
++workloads = ['caida']
++threads = []
++started_threads = []
++semaphore = threading.Semaphore(multiprocessing.cpu_count())
++numLines = 1000000 # num flows
++iterations = 1
++rates = get_synth_mispred_rates(path="./CAIDA_135000.all.0.02_fnr_to_fpr.csv")
++
++for it in range(iterations):
++    for tpr, tnr in zip(rates["tpr"], rates["tnr"]):
++        print tpr
++        print tnr
++        threads = []
++        for l in loads:
++            for r in runs:
++                for w in workloads:
++                    cdf = cdf_temp.format(w)
++            
++                    #  generate conf file
++                    if r == 'synth':
++                        conf_str = conf_str_synth.format(numLines, cdf, l, tpr, tnr)
++                    else:
++                        assert False, r
++            
++                    confFile = "synth/conf_{0}_{1}_{2}_{3}tpr_{4}tnr.txt".format(r, w, l, tpr, tnr)
++                    with open(confFile, 'w') as f:
++                        print confFile
++                        f.write(conf_str)
++            
++                    threads.append(threading.Thread(target=run_exp, args=((r, w, l), semaphore, it, tpr, tnr)))
++        
++        print '\n'
++        
++        max_threads = 10
++        while len(threads) > 0:
++            if threading.active_count() < max_threads:
++                thread = threads.pop()
++                thread.start()
++                started_threads.append(thread)
++            else:
++                [t.join() for t in started_threads]
++        
++        [t.join() for t in started_threads]
++        print 'finished', len(started_threads), 'experiments'
++        
++        # process results 
++        
++        for r in runs:
++            for w in workloads:
++                result_file = 'synth/result_{0}_{1}_{2}_{3}tpr_{4}tnr.txt'.format(r, w, it, tpr, tnr)
++                with open(result_file, "w") as f:
++                    for l in loads:
++                        output = subprocess.check_output("./compute_avg_slowdown.py --file synth/result_{0}_{1}_{2}_{3}tpr_{4}tnr.txt".format(r, w, l, tpr, tnr), shell=True)
++                        f.write("{} {}".format(l,output))
++                        subprocess.check_output("rm synth/result_{0}_{1}_{2}_{3}tpr_{4}tnr.txt".format(r, w, l, tpr, tnr), shell=True)
++
++for r in runs:
++    for tpr, tnr in zip(rates["tpr"], rates["tnr"]):
++        for w in workloads:
++            suff = ""
++            if numLines == 10000:
++                suff = "10K"
++            if numLines == 100000:
++                suff = "100K"
++            if numLines == 1000000:
++                suff = "1M"
++            if numLines == 10000000:
++                suff = "10M"
++            out_file_name = 'synth/result_{0}_{1}_{2}_{3}tpr_{4}tnr.txt'.format(r, w, suff, tpr, tnr)
++            out_file = open(out_file_name,"w")
++            avg_slowdown = {}
++            mice_slowdown = {}
++            eleph_slowdown = {}
++            for l in loads:
++                avg_slowdown[l] = 0.0
++                mice_slowdown[l] = 0.0
++                eleph_slowdown[l] = 0.0
++            for it in range(iterations):
++                result_file = 'synth/result_{0}_{1}_{2}_{3}tpr_{4}tnr.txt'.format(r, w, it, tpr, tnr)
++                with open(result_file, "r") as f:
++                    for line in f.readlines():
++                        rec = line.split(" ")
++                        load = float(rec[0])
++                        avg_slowdown[load] += float(rec[1])
++                        eleph_slowdown[load] += float(rec[2])
++                        mice_slowdown[load] += float(rec[3])
++            for l in loads:
++                avg_slowdown[l] /= iterations
++                mice_slowdown[l] /= iterations
++                eleph_slowdown[l] /= iterations
++                out_file.write("{} {} {} {}\n".format(l, avg_slowdown[l], eleph_slowdown[l], mice_slowdown[l]))
+\ No newline at end of file
+diff --git a/py/run_experiments_mawi.py b/py/run_experiments_mawi.py
+new file mode 100755
+index 0000000..3c2ac0b
+--- /dev/null
++++ b/py/run_experiments_mawi.py
+@@ -0,0 +1,374 @@
++#!/usr/bin/python2
++
++import subprocess
++import threading
++import multiprocessing
++import argparse
++
++
++conf_str_coda = '''init_cwnd: 12
++max_cwnd: 15
++retx_timeout: 45e-06
++queue_size: 36864
++propagation_delay: 0.0000002
++bandwidth: 40000000000.0
++queue_type: 2
++flow_type: 3
++num_flow: {0}
++flow_trace: ./{1}
++cut_through: 1
++mean_flow_size: 0
++load_balancing: 0
++preemptive_queue: 0
++big_switch: 0
++host_type: 1
++traffic_imbalance: 0
++load: {2}
++reauth_limit: 3
++magic_trans_slack: 1.1
++magic_delay_scheduling: 1
++use_flow_trace: 0
++smooth_cdf: 1
++burst_at_beginning: 0
++capability_timeout: 1.5
++capability_resend_timeout: 9
++capability_initial: 8
++capability_window: 8
++capability_window_timeout: 25
++ddc: 0
++ddc_cpu_ratio: 0.33
++ddc_mem_ratio: 0.33
++ddc_disk_ratio: 0.34
++ddc_normalize: 2
++ddc_type: 0
++deadline: 0
++schedule_by_deadline: 0
++avg_deadline: 0.0001
++capability_third_level: 1
++capability_fourth_level: 0
++magic_inflate: 1
++interarrival_cdf: none
++num_host_types: 13
++hh_tp_rate: {3}
++mice_tp_rate: {4}
++hh_percentage: 0.99
++permutation_tm: 1
++packet_cache_limit: 5
++'''
++
++conf_str_pheavy = '''init_cwnd: 12
++max_cwnd: 15
++retx_timeout: 45e-06
++queue_size: 36864
++propagation_delay: 0.0000002
++bandwidth: 40000000000.0
++queue_type: 2
++flow_type: 3
++num_flow: {0}
++flow_trace: ./{1}
++cut_through: 1
++mean_flow_size: 0
++load_balancing: 0
++preemptive_queue: 0
++big_switch: 0
++host_type: 1
++traffic_imbalance: 0
++load: {2}
++reauth_limit: 3
++magic_trans_slack: 1.1
++magic_delay_scheduling: 1
++use_flow_trace: 0
++smooth_cdf: 1
++burst_at_beginning: 0
++capability_timeout: 1.5
++capability_resend_timeout: 9
++capability_initial: 8
++capability_window: 8
++capability_window_timeout: 25
++ddc: 0
++ddc_cpu_ratio: 0.33
++ddc_mem_ratio: 0.33
++ddc_disk_ratio: 0.34
++ddc_normalize: 2
++ddc_type: 0
++deadline: 0
++schedule_by_deadline: 0
++avg_deadline: 0.0001
++capability_third_level: 1
++capability_fourth_level: 0
++magic_inflate: 1
++interarrival_cdf: none
++num_host_types: 13
++hh_tp_rate: {3}
++mice_tp_rate: {4}
++hh_percentage: 0.99
++permutation_tm: 1
++packet_cache_limit: 5
++'''
++
++conf_str_fifo = '''init_cwnd: 12
++max_cwnd: 15
++retx_timeout: 45e-06
++queue_size: 36864
++propagation_delay: 0.0000002
++bandwidth: 40000000000.0
++queue_type: 1
++flow_type: 1
++num_flow: {0}
++flow_trace: ./{1}
++cut_through: 1
++mean_flow_size: 0
++load_balancing: 0
++preemptive_queue: 0
++big_switch: 0
++host_type: 1
++traffic_imbalance: 0
++load: {2}
++reauth_limit: 3
++magic_trans_slack: 1.1
++magic_delay_scheduling: 1
++use_flow_trace: 0
++smooth_cdf: 1
++burst_at_beginning: 0
++capability_timeout: 1.5
++capability_resend_timeout: 9
++capability_initial: 8
++capability_window: 8
++capability_window_timeout: 25
++ddc: 0
++ddc_cpu_ratio: 0.33
++ddc_mem_ratio: 0.33
++ddc_disk_ratio: 0.34
++ddc_normalize: 2
++ddc_type: 0
++deadline: 0
++schedule_by_deadline: 0
++avg_deadline: 0.0001
++capability_third_level: 1
++capability_fourth_level: 0
++magic_inflate: 1
++interarrival_cdf: none
++num_host_types: 13
++permutation_tm: 1
++'''
++
++conf_str_pfabric = '''init_cwnd: 12
++max_cwnd: 15
++retx_timeout: 45e-06
++queue_size: 36864
++propagation_delay: 0.0000002
++bandwidth: 40000000000.0
++queue_type: 2
++flow_type: 2
++num_flow: {0}
++flow_trace: ./{1}
++cut_through: 1
++mean_flow_size: 0
++load_balancing: 0
++preemptive_queue: 0
++big_switch: 0
++host_type: 1
++traffic_imbalance: 0
++load: {2}
++reauth_limit: 3
++magic_trans_slack: 1.1
++magic_delay_scheduling: 1
++use_flow_trace: 0
++smooth_cdf: 1
++burst_at_beginning: 0
++capability_timeout: 1.5
++capability_resend_timeout: 9
++capability_initial: 8
++capability_window: 8
++capability_window_timeout: 25
++ddc: 0
++ddc_cpu_ratio: 0.33
++ddc_mem_ratio: 0.33
++ddc_disk_ratio: 0.34
++ddc_normalize: 2
++ddc_type: 0
++deadline: 0
++schedule_by_deadline: 0
++avg_deadline: 0.0001
++capability_third_level: 1
++capability_fourth_level: 0
++magic_inflate: 1
++interarrival_cdf: none
++num_host_types: 13
++permutation_tm: 1
++'''
++
++conf_str_phost = '''init_cwnd: 2
++max_cwnd: 6
++retx_timeout: 9.50003e-06
++queue_size: 36864
++propagation_delay: 0.0000002
++bandwidth: 40000000000.0
++queue_type: 2
++flow_type: 112
++num_flow: {0}
++flow_trace: ./{1}
++cut_through: 1
++mean_flow_size: 0
++load_balancing: 0
++preemptive_queue: 0
++big_switch: 0
++host_type: 12
++traffic_imbalance: 0
++load: {2}
++reauth_limit: 3
++magic_trans_slack: 1.1
++magic_delay_scheduling: 1
++use_flow_trace: 0
++smooth_cdf: 1
++burst_at_beginning: 0
++capability_timeout: 1.5
++capability_resend_timeout: 9
++capability_initial: 8
++capability_window: 8
++capability_window_timeout: 25
++ddc: 0
++ddc_cpu_ratio: 0.33
++ddc_mem_ratio: 0.33
++ddc_disk_ratio: 0.34
++ddc_normalize: 2
++ddc_type: 0
++deadline: 0
++schedule_by_deadline: 0
++avg_deadline: 0.0001
++capability_third_level: 1
++capability_fourth_level: 0
++magic_inflate: 1
++interarrival_cdf: none
++num_host_types: 13
++permutation_tm: 1
++'''
++
++def getNumLines(trace):
++    out = subprocess.check_output('wc -l {}'.format(trace), shell=True)
++    return int(out.split()[0])
++
++def run_exp(rw, semaphore, seed):
++    semaphore.acquire()
++    (a, b, c) = rw
++    print template.format(a,b,c,seed)
++    subprocess.call(template.format(a,b,c,seed), shell=True)
++    semaphore.release()
++
++template = '../simulator 1 mawi/conf_{0}_{1}_{2}.txt {3} > mawi/result_{0}_{1}_{2}.txt'
++cdf_temp = './CDF_{}.txt'
++loads = [0.5, 0.8]
++runs = [
++    'coda', 
++    'pfabric', 
++    'phost', 
++    'fifo', 
++    'pheavy'
++]
++workloads = ['mawi']
++threads = []
++started_threads = []
++semaphore = threading.Semaphore(multiprocessing.cpu_count())
++numLines = 1000000 # num flows
++iterations = 1
++
++
++def main(args):
++    for it in range(iterations):
++        threads = []
++        for l in loads:
++            for r in runs:
++                for w in workloads:
++                    cdf = cdf_temp.format(w)
++            
++                    #  generate conf file
++                    if r == 'pfabric':
++                        conf_str = conf_str_pfabric.format(numLines, cdf, l)
++                    elif r == 'coda':
++                        conf_str = conf_str_coda.format(numLines, cdf, l, args.tpr_dumbo, args.tnr_dumbo)
++                    elif r == 'pheavy':
++                        conf_str = conf_str_pheavy.format(numLines, cdf, l, args.tpr_pheavy, args.tnr_pheavy)
++                    elif r == 'fifo':
++                        conf_str = conf_str_fifo.format(numLines, cdf, l)
++                    elif r == 'phost':
++                        conf_str = conf_str_phost.format(numLines, cdf, l)
++                    else:
++                        assert False, r
++            
++                    confFile = "mawi/conf_{0}_{1}_{2}.txt".format(r, w, l)
++                    with open(confFile, 'w') as f:
++                        print confFile
++                        f.write(conf_str)
++            
++                    threads.append(threading.Thread(target=run_exp, args=((r, w, l), semaphore, it)))
++        
++        print '\n'
++        
++        max_threads = 10
++        while len(threads) > 0:
++            if threading.active_count() < max_threads:
++                thread = threads.pop()
++                thread.start()
++                started_threads.append(thread)
++            else:
++                [t.join() for t in started_threads]
++        
++        [t.join() for t in started_threads]
++        print 'finished', len(started_threads), 'experiments'
++        
++        # process results 
++        
++        for r in runs:
++            for w in workloads:
++                result_file = 'mawi/result_{0}_{1}_{2}.txt'.format(r,w,it)
++                with open(result_file, "w") as f:
++                    for l in loads:
++                        output = subprocess.check_output("./compute_avg_slowdown.py --file mawi/result_{0}_{1}_{2}.txt".format(r, w, l), shell=True)
++                        f.write("{} {}".format(l,output))
++                        subprocess.check_output("rm mawi/result_{0}_{1}_{2}.txt".format(r, w, l), shell=True)
++
++    for r in runs:
++        for w in workloads:
++            suff = ""
++            if numLines == 10000:
++                suff = "10K"
++            if numLines == 100000:
++                suff = "100K"
++            if numLines == 1000000:
++                suff = "1M"
++            if numLines == 10000000:
++                suff = "10M"
++            out_file_name = 'result_{0}_{1}_{2}.txt'.format(r, w, suff)
++            out_file = open(out_file_name,"w")
++            avg_slowdown = {}
++            mice_slowdown = {}
++            eleph_slowdown = {}
++            for l in loads:
++                avg_slowdown[l] = 0.0
++                mice_slowdown[l] = 0.0
++                eleph_slowdown[l] = 0.0
++            for it in range(iterations):
++                result_file = 'mawi/result_{0}_{1}_{2}.txt'.format(r,w,it)
++                with open(result_file, "r") as f:
++                    for line in f.readlines():
++                        rec = line.split(" ")
++                        load = float(rec[0])
++                        avg_slowdown[load] += float(rec[1])
++                        eleph_slowdown[load] += float(rec[2])
++                        mice_slowdown[load] += float(rec[3])
++            for l in loads:
++                avg_slowdown[l] /= iterations
++                mice_slowdown[l] /= iterations
++                eleph_slowdown[l] /= iterations
++                out_file.write("{} {} {} {}\n".format(l,avg_slowdown[l],eleph_slowdown[l],mice_slowdown[l]))
++            
++if __name__ == "__main__":
++
++    argparser = argparse.ArgumentParser()
++    argparser.add_argument("--tpr-dumbo", help="DUMBO True Positive Rate (for performance simulation)", type=float, required=True)
++    argparser.add_argument("--tnr-dumbo", help="DUMBO True Negative Rate (for performance simulation)", type=float, required=True)
++    argparser.add_argument("--tpr-pheavy", help="pHeavy True Positive Rate (for performance simulation)", type=float, required=True)
++    argparser.add_argument("--tnr-pheavy", help="pHeavy True Negative Rate (for performance simulation)", type=float, required=True)
++    args = argparser.parse_args()
++
++    main(args)
+\ No newline at end of file
+diff --git a/py/run_experiments_uni.py b/py/run_experiments_uni.py
+new file mode 100755
+index 0000000..1c1e31c
+--- /dev/null
++++ b/py/run_experiments_uni.py
+@@ -0,0 +1,375 @@
++#!/usr/bin/python2
++
++import subprocess
++import threading
++import multiprocessing
++import argparse
++
++
++conf_str_coda = '''init_cwnd: 12
++max_cwnd: 15
++retx_timeout: 45e-06
++queue_size: 36864
++propagation_delay: 0.0000002
++bandwidth: 40000000000.0
++queue_type: 2
++flow_type: 3
++num_flow: {0}
++flow_trace: ./{1}
++cut_through: 1
++mean_flow_size: 0
++load_balancing: 0
++preemptive_queue: 0
++big_switch: 0
++host_type: 1
++traffic_imbalance: 0
++load: {2}
++reauth_limit: 3
++magic_trans_slack: 1.1
++magic_delay_scheduling: 1
++use_flow_trace: 0
++smooth_cdf: 1
++burst_at_beginning: 0
++capability_timeout: 1.5
++capability_resend_timeout: 9
++capability_initial: 8
++capability_window: 8
++capability_window_timeout: 25
++ddc: 0
++ddc_cpu_ratio: 0.33
++ddc_mem_ratio: 0.33
++ddc_disk_ratio: 0.34
++ddc_normalize: 2
++ddc_type: 0
++deadline: 0
++schedule_by_deadline: 0
++avg_deadline: 0.0001
++capability_third_level: 1
++capability_fourth_level: 0
++magic_inflate: 1
++interarrival_cdf: none
++num_host_types: 13
++hh_tp_rate: {3}
++mice_tp_rate: {4}
++hh_percentage: 0.99
++permutation_tm: 1
++packet_cache_limit: 5
++'''
++
++conf_str_pheavy = '''init_cwnd: 12
++max_cwnd: 15
++retx_timeout: 45e-06
++queue_size: 36864
++propagation_delay: 0.0000002
++bandwidth: 40000000000.0
++queue_type: 2
++flow_type: 3
++num_flow: {0}
++flow_trace: ./{1}
++cut_through: 1
++mean_flow_size: 0
++load_balancing: 0
++preemptive_queue: 0
++big_switch: 0
++host_type: 1
++traffic_imbalance: 0
++load: {2}
++reauth_limit: 3
++magic_trans_slack: 1.1
++magic_delay_scheduling: 1
++use_flow_trace: 0
++smooth_cdf: 1
++burst_at_beginning: 0
++capability_timeout: 1.5
++capability_resend_timeout: 9
++capability_initial: 8
++capability_window: 8
++capability_window_timeout: 25
++ddc: 0
++ddc_cpu_ratio: 0.33
++ddc_mem_ratio: 0.33
++ddc_disk_ratio: 0.34
++ddc_normalize: 2
++ddc_type: 0
++deadline: 0
++schedule_by_deadline: 0
++avg_deadline: 0.0001
++capability_third_level: 1
++capability_fourth_level: 0
++magic_inflate: 1
++interarrival_cdf: none
++num_host_types: 13
++hh_tp_rate: {3} 
++mice_tp_rate: {4}
++hh_percentage: 0.99
++permutation_tm: 1
++packet_cache_limit: 5
++'''
++
++conf_str_fifo = '''init_cwnd: 12
++max_cwnd: 15
++retx_timeout: 45e-06
++queue_size: 36864
++propagation_delay: 0.0000002
++bandwidth: 40000000000.0
++queue_type: 1
++flow_type: 1
++num_flow: {0}
++flow_trace: ./{1}
++cut_through: 1
++mean_flow_size: 0
++load_balancing: 0
++preemptive_queue: 0
++big_switch: 0
++host_type: 1
++traffic_imbalance: 0
++load: {2}
++reauth_limit: 3
++magic_trans_slack: 1.1
++magic_delay_scheduling: 1
++use_flow_trace: 0
++smooth_cdf: 1
++burst_at_beginning: 0
++capability_timeout: 1.5
++capability_resend_timeout: 9
++capability_initial: 8
++capability_window: 8
++capability_window_timeout: 25
++ddc: 0
++ddc_cpu_ratio: 0.33
++ddc_mem_ratio: 0.33
++ddc_disk_ratio: 0.34
++ddc_normalize: 2
++ddc_type: 0
++deadline: 0
++schedule_by_deadline: 0
++avg_deadline: 0.0001
++capability_third_level: 1
++capability_fourth_level: 0
++magic_inflate: 1
++interarrival_cdf: none
++num_host_types: 13
++permutation_tm: 1
++'''
++
++conf_str_pfabric = '''init_cwnd: 12
++max_cwnd: 15
++retx_timeout: 45e-06
++queue_size: 36864
++propagation_delay: 0.0000002
++bandwidth: 40000000000.0
++queue_type: 2
++flow_type: 2
++num_flow: {0}
++flow_trace: ./{1}
++cut_through: 1
++mean_flow_size: 0
++load_balancing: 0
++preemptive_queue: 0
++big_switch: 0
++host_type: 1
++traffic_imbalance: 0
++load: {2}
++reauth_limit: 3
++magic_trans_slack: 1.1
++magic_delay_scheduling: 1
++use_flow_trace: 0
++smooth_cdf: 1
++burst_at_beginning: 0
++capability_timeout: 1.5
++capability_resend_timeout: 9
++capability_initial: 8
++capability_window: 8
++capability_window_timeout: 25
++ddc: 0
++ddc_cpu_ratio: 0.33
++ddc_mem_ratio: 0.33
++ddc_disk_ratio: 0.34
++ddc_normalize: 2
++ddc_type: 0
++deadline: 0
++schedule_by_deadline: 0
++avg_deadline: 0.0001
++capability_third_level: 1
++capability_fourth_level: 0
++magic_inflate: 1
++interarrival_cdf: none
++num_host_types: 13
++permutation_tm: 1
++'''
++
++conf_str_phost = '''init_cwnd: 2
++max_cwnd: 6
++retx_timeout: 9.50003e-06
++queue_size: 36864
++propagation_delay: 0.0000002
++bandwidth: 40000000000.0
++queue_type: 2
++flow_type: 112
++num_flow: {0}
++flow_trace: ./{1}
++cut_through: 1
++mean_flow_size: 0
++load_balancing: 0
++preemptive_queue: 0
++big_switch: 0
++host_type: 12
++traffic_imbalance: 0
++load: {2}
++reauth_limit: 3
++magic_trans_slack: 1.1
++magic_delay_scheduling: 1
++use_flow_trace: 0
++smooth_cdf: 1
++burst_at_beginning: 0
++capability_timeout: 1.5
++capability_resend_timeout: 9
++capability_initial: 8
++capability_window: 8
++capability_window_timeout: 25
++ddc: 0
++ddc_cpu_ratio: 0.33
++ddc_mem_ratio: 0.33
++ddc_disk_ratio: 0.34
++ddc_normalize: 2
++ddc_type: 0
++deadline: 0
++schedule_by_deadline: 0
++avg_deadline: 0.0001
++capability_third_level: 1
++capability_fourth_level: 0
++magic_inflate: 1
++interarrival_cdf: none
++num_host_types: 13
++permutation_tm: 1
++'''
++
++def getNumLines(trace):
++    out = subprocess.check_output('wc -l {}'.format(trace), shell=True)
++    return int(out.split()[0])
++
++def run_exp(rw, semaphore, seed):
++    semaphore.acquire()
++    (a, b, c) = rw
++    print template.format(a,b,c,seed)
++    subprocess.call(template.format(a,b,c,seed), shell=True)
++    semaphore.release()
++
++template = '../simulator 1 uni/conf_{0}_{1}_{2}.txt {3} > uni/result_{0}_{1}_{2}.txt'
++cdf_temp = './CDF_{}.txt'
++loads = [0.5, 0.8]
++runs = [
++    'coda', 
++    'pfabric', 
++    'phost', 
++    'fifo', 
++    'pheavy'
++]
++workloads = ['uni']
++threads = []
++started_threads = []
++semaphore = threading.Semaphore(multiprocessing.cpu_count())
++numLines = 1000000 # num flows
++iterations = 1
++
++
++def main(args):
++    for it in range(iterations):
++        threads = []
++        for l in loads:
++            for r in runs:
++                for w in workloads:
++                    cdf = cdf_temp.format(w)
++            
++                    #  generate conf file
++                    if r == 'pfabric':
++                        conf_str = conf_str_pfabric.format(numLines, cdf, l)
++                    elif r == 'coda':
++                        conf_str = conf_str_coda.format(numLines, cdf, l, args.tpr_dumbo, args.tnr_dumbo)
++                    elif r == 'pheavy':
++                        conf_str = conf_str_pheavy.format(numLines, cdf, l, args.tpr_pheavy, args.tnr_pheavy)
++                    elif r == 'fifo':
++                        conf_str = conf_str_fifo.format(numLines, cdf, l)
++                    elif r == 'phost':
++                        conf_str = conf_str_phost.format(numLines, cdf, l)
++                    else:
++                        assert False, r
++            
++                    confFile = "uni/conf_{0}_{1}_{2}.txt".format(r, w, l)
++                    with open(confFile, 'w') as f:
++                        print confFile
++                        f.write(conf_str)
++            
++                    threads.append(threading.Thread(target=run_exp, args=((r, w, l), semaphore, it)))
++        
++        print '\n'
++        
++        max_threads = 5
++        while len(threads) > 0:
++            if threading.active_count() < max_threads:
++                thread = threads.pop()
++                thread.start()
++                started_threads.append(thread)
++            else:
++                [t.join() for t in started_threads]
++        
++        [t.join() for t in started_threads]
++        print 'finished', len(started_threads), 'experiments'
++        
++        # process results 
++        
++        for r in runs:
++            for w in workloads:
++                result_file = 'uni/result_{0}_{1}_{2}.txt'.format(r,w,it)
++                with open(result_file, "w") as f:
++                    for l in loads:
++                        output = subprocess.check_output("./compute_avg_slowdown.py --file uni/result_{0}_{1}_{2}.txt".format(r, w, l), shell=True)
++                        f.write("{} {}".format(l,output))
++                        subprocess.check_output("rm uni/result_{0}_{1}_{2}.txt".format(r, w, l), shell=True)
++
++    for r in runs:
++        for w in workloads:
++            suff = ""
++            if numLines == 10000:
++                suff = "10K"
++            if numLines == 100000:
++                suff = "100K"
++            if numLines == 1000000:
++                suff = "1M"
++            if numLines == 10000000:
++                suff = "10M"
++            out_file_name = 'result_{0}_{1}_{2}.txt'.format(r, w, suff)
++            out_file = open(out_file_name,"w")
++            avg_slowdown = {}
++            mice_slowdown = {}
++            eleph_slowdown = {}
++            for l in loads:
++                avg_slowdown[l] = 0.0
++                mice_slowdown[l] = 0.0
++                eleph_slowdown[l] = 0.0
++            for it in range(iterations):
++                result_file = 'uni/result_{0}_{1}_{2}.txt'.format(r,w,it)
++                with open(result_file, "r") as f:
++                    for line in f.readlines():
++                        rec = line.split(" ")
++                        load = float(rec[0])
++                        avg_slowdown[load] += float(rec[1])
++                        eleph_slowdown[load] += float(rec[2])
++                        mice_slowdown[load] += float(rec[3])
++            for l in loads:
++                avg_slowdown[l] /= iterations
++                mice_slowdown[l] /= iterations
++                eleph_slowdown[l] /= iterations
++                out_file.write("{} {} {} {}\n".format(l,avg_slowdown[l],eleph_slowdown[l],mice_slowdown[l]))
++        
++
++
++if __name__ == "__main__":
++    argparser = argparse.ArgumentParser()
++    argparser.add_argument("--tpr-dumbo", help="DUMBO True Positive Rate (for performance simulation)", type=float, required=True)
++    argparser.add_argument("--tnr-dumbo", help="DUMBO True Negative Rate (for performance simulation)", type=float, required=True)
++    argparser.add_argument("--tpr-pheavy", help="pHeavy True Positive Rate (for performance simulation)", type=float, required=True)
++    argparser.add_argument("--tnr-pheavy", help="pHeavy True Negative Rate (for performance simulation)", type=float, required=True)
++    args = argparser.parse_args()
++    
++    main(args)
+diff --git a/run/experiment.cpp b/run/experiment.cpp
+index e901b9e..a6b9a36 100644
+--- a/run/experiment.cpp
++++ b/run/experiment.cpp
+@@ -29,6 +29,7 @@
+ #include "params.h"
+ 
+ #include "../ext/ideal.h"
++#include "../ext/flowsizeoracle.h"
+ 
+ extern Topology *topology;
+ extern double current_time;
+@@ -54,6 +55,8 @@ extern double get_current_time();
+ 
+ extern void run_scenario();
+ 
++extern FlowSizeOracle* flow_size_oracle;
++
+ void validate_flow(Flow* f){
+     double slowdown = 1000000.0 * f->flow_completion_time / topology->get_oracle_fct(f);
+     if(slowdown < 0.999999){
+@@ -162,6 +165,9 @@ void run_experiment(int argc, char **argv, uint32_t exp_type) {
+     params.num_hosts = 144;
+     params.num_agg_switches = 9;
+     params.num_core_switches = 4;
++
++    flow_size_oracle = new FlowSizeOracle(params.hh_percentage, params.hh_tp_rate, params.mice_tp_rate, params.packet_cache_limit);
++
+     
+     if (params.flow_type == FASTPASS_FLOW) {
+         topology = new FastpassTopology(params.num_hosts, params.num_agg_switches, params.num_core_switches, params.bandwidth, params.queue_type);
+@@ -202,6 +208,7 @@ void run_experiment(int argc, char **argv, uint32_t exp_type) {
+         //generate_flows_to_schedule_fd_with_skew(params.cdf_or_flow_trace, num_flows, topology);
+     }
+ 
++
+     if (params.deadline) {
+         assign_flow_deadline(flows_to_schedule);
+     }
+@@ -239,6 +246,8 @@ void run_experiment(int argc, char **argv, uint32_t exp_type) {
+     // 
+     // everything before this is setup; everything after is analysis
+     //
++    // update flow oracle before running
++    flow_size_oracle->update_size_threshold();
+     run_scenario();
+ 
+     for (uint32_t i = 0; i < flows_sorted.size(); i++) {
+diff --git a/run/flow_generator.cpp b/run/flow_generator.cpp
+index 09cffaf..af053b6 100644
+--- a/run/flow_generator.cpp
++++ b/run/flow_generator.cpp
+@@ -6,6 +6,9 @@
+ //
+ 
+ #include "flow_generator.h"
++#include "../ext/flowsizeoracle.h"
++
++extern FlowSizeOracle* flow_size_oracle;
+ 
+ FlowGenerator::FlowGenerator(uint32_t num_flows, Topology *topo, std::string filename) {
+     this->num_flows = num_flows;
+diff --git a/run/params.cpp b/run/params.cpp
+index e8dc99d..bc2ce0f 100644
+--- a/run/params.cpp
++++ b/run/params.cpp
+@@ -173,6 +173,22 @@ void read_experiment_parameters(std::string conf_filename, uint32_t exp_type) {
+         else if (key == "bytes_mode") {
+             lineStream >> params.bytes_mode;
+         }
++        else if (key == "hh_tp_rate") {
++            lineStream >> params.hh_tp_rate;
++        }
++        else if (key == "mice_tp_rate") {
++            lineStream >> params.mice_tp_rate;
++        }
++        else if (key == "hh_percentage") {
++            lineStream >> params.hh_percentage;
++        }
++        else if (key == "packet_cdf") {
++            lineStream >> params.packet_cdf;
++        }
++        else if (key == "packet_cache_limit") {
++            lineStream >> params.packet_cache_limit;
++        }
++
+         //else if (key == "dctcp_delayed_ack_freq") {
+         //    lineStream >> params.dctcp_delayed_ack_freq;
+         //}
+diff --git a/run/params.h b/run/params.h
+index be8af55..4a40ebe 100644
+--- a/run/params.h
++++ b/run/params.h
+@@ -8,6 +8,14 @@ class DCExpParams {
+     public:
+         std::string param_str;
+ 
++       float hh_tp_rate;
++       float mice_tp_rate;
++       float hh_percentage;
++       uint32_t packet_cache_limit;
++
++       uint32_t packet_cdf;
++
++
+         uint32_t initial_cwnd;
+         uint32_t max_cwnd;
+         double retx_timeout_value;

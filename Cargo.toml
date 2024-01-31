@@ -1,0 +1,45 @@
+[package]
+name = "CODA-simu"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+#[profile.release]
+#debug = 1
+
+[dependencies]
+close-file = "*"
+rand = "*"
+itertools = "*"
+cpython = "*"
+pcap-parser = { version = "*", features = ["data"] }
+packet = "*"
+csv = "*"
+rand_distr = "*"
+clap = { version = "3.1.6", features = ["derive"] }
+blake3 = "1.5.0"
+
+[[bin]]
+name = "simulation_fse"
+path = "src/simulation_fse.rs"
+
+[[bin]]
+name = "simulation_baseline"
+path = "src/simulation_baseline.rs"
+
+[[bin]]
+name = "simulation_fse_fm"
+path = "src/simulation_fse_fm.rs"
+
+[[bin]]
+name = "simulation_iat_fm"
+path = "src/simulation_iat_fm.rs"
+
+[[bin]]
+name = "pcap_parser"
+path = "src/pcap_parser.rs"
+
+[[bin]]
+name = "elastic_sketch_pcap_parser"
+path = "src/pcap_parser_es.rs"
