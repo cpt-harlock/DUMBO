@@ -95,8 +95,9 @@ If you have found this paper useful, please cite us using:
   author={Azorin, Raphael and Monterubbiano, Andrea and Castellano, Gabriele and Gallo, Massimo and Pontarelli, Salvatore and Rossi, Dario},
   journal={Proceedings of the ACM on Networking},
   volume={2},
-  number={CoNEXT4},
-  pages={1--25},
+  number={CoNEXT1},
+  articleno = {5},
+  numpages={24},
   year={2024},
   publisher={ACM New York, NY, USA}
 }
