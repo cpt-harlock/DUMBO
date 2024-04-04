@@ -1,3 +1,7 @@
+This repository contains the training, testing and simulator code used to build the DUMBO system from the research paper [Taming the Elephants: Affordable Flow Length Prediction in the Data Plane](https://dl.acm.org/doi/10.1145/3649473) 
+DUMBO is a versatile networked system that integrates a lightweight traffic classifier to enhance several downstream tasks in the data plane (e.g., packet scheduling, inter-arrival times distribution estimation, flow length estimation). 
+The main idea of DUMBO is to segregate elephants and mice flows to address them separately, hence saving memory and improving performance over standard baselines.
+
 ## Introduction
 This document serves as a guide to install and use the DUMBO system on real traffic traces.
 
