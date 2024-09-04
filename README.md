@@ -45,10 +45,10 @@ Follow these instructions to quickly set up the repository and reproduce the exp
 
 2. **Data**
 
-Download, uncompress and store the ```*.pcap``` files in the appropriate folder:
-   - ```./data/caida/pcap/```
-   - ```./data/mawi/pcap/```
-   - ```./data/uni/pcap/```
+Download the traces (see *Traffic traces* below). Uncompress and store the ```*.pcap``` files in the appropriate folder:
+   - ```./data/caida/pcap/equinix-chicago.dirA.20160121-{hour}.UTC.anon.pcap```
+   - ```./data/mawi/pcap/20190409{hour}.pcap```
+   - ```./data/uni/pcap/univ2.pcap```
 
 3. **Scheduling simulator**
 
